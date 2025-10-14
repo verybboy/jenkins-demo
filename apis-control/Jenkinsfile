@@ -1,0 +1,85 @@
+pipeline {
+  agent {
+    docker {
+      image 'python:3.11-slim'
+    }
+  }
+
+  options {
+    timestamps()
+    ansiColor('xterm')
+  }
+
+  stages {
+
+    stage('Checkout') {
+      steps {
+        checkout scm
+      }
+    }
+
+    stage('Instalar dependencias') {
+      steps {
+        sh '''
+          apt-get update -qq
+          apt-get install -y curl
+          python -m venv .venv
+          . .venv/bin/activate
+          pip install requests
+        '''
+      }
+    }
+
+    stage('Comprobar APIs') {
+      steps {
+        sh '''
+          set -e
+          . .venv/bin/activate
+
+          echo "=== Comprobando APIs desde api_endpoints.txt ==="
+          python - <<'PY'
+import requests, sys, time
+
+filename = "api_endpoints.txt"
+try:
+    with open(filename, "r") as f:
+        urls = [line.strip() for line in f if line.strip()]
+except FileNotFoundError:
+    print(f"ERROR: No se encuentra el archivo {filename}")
+    sys.exit(1)
+
+if not urls:
+    print("No hay URLs en el archivo.")
+    sys.exit(1)
+
+for url in urls:
+    print(f"\n🔎 Probando {url} ...")
+    try:
+        start = time.time()
+        resp = requests.get(url, timeout=10)
+        elapsed = round((time.time() - start) * 1000)
+        if resp.status_code == 200:
+            print(f"✅ {url} OK (HTTP 200) — {elapsed} ms")
+        else:
+            print(f"❌ {url} devolvió {resp.status_code}")
+            sys.exit(1)
+    except requests.exceptions.RequestException as e:
+        print(f"❌ Error al conectar con {url}: {e}")
+        sys.exit(1)
+
+print("\nTodas las APIs respondieron correctamente ✅")
+PY
+        '''
+      }
+    }
+  }
+
+  post {
+    success {
+      echo '✅ Todas las APIs están funcionando correctamente.'
+    }
+    failure {
+      echo '❌ Alguna API no respondió correctamente.'
+    }
+  }
+}
