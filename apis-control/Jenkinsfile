@@ -1,85 +1,101 @@
 pipeline {
-  agent {
-    docker {
-      image 'python:3.11-slim'
-    }
-  }
+  agent any
 
   options {
     timestamps()
-    ansiColor('xterm')
+  }
+
+  parameters {
+    string(name: 'ENDPOINTS_FILE', defaultValue: 'api_endpoints.txt', description: 'Ruta del archivo con URLs')
+    string(name: 'TIMEOUT_SECONDS', defaultValue: '10', description: 'Timeout por request (curl --max-time)')
+    string(name: 'LATENCY_FAIL_MS', defaultValue: '2000', description: 'Umbral de fallo de latencia (ms)')
+    string(name: 'EXPECTED_CODES', defaultValue: '200,403', description: 'Códigos HTTP válidos, separados por coma')
+    text(name: 'HEADERS', defaultValue: '', description: 'Cabeceras: una por línea en formato key=value')
   }
 
   stages {
-
     stage('Checkout') {
-      steps {
-        checkout scm
-      }
+      steps { checkout scm }
     }
 
-    stage('Instalar dependencias') {
+    stage('Comprobar APIs con curl') {
       steps {
         sh '''
-          apt-get update -qq
-          apt-get install -y curl
-          python -m venv .venv
-          . .venv/bin/activate
-          pip install requests
+          set -euo pipefail
+          echo "Leyendo endpoints de: ${ENDPOINTS_FILE}"
+          test -f "${ENDPOINTS_FILE}" || { echo "No existe ${ENDPOINTS_FILE}"; exit 1; }
+
+          # Construye -H para curl a partir de HEADERS (key=value por línea)
+          HEADER_ARGS=()
+          while IFS= read -r line; do
+            line="${line#"${line%%[![:space:]]*}"}"; line="${line%"${line##*[![:space:]]}"}"  # trim
+            [ -z "$line" ] && continue
+            case "$line" in \#*) continue;; esac
+            key="${line%%=*}"
+            val="${line#*=}"
+            HEADER_ARGS+=(-H "${key}: ${val}")
+          done <<'EOF_HEADERS'
+${HEADERS}
+EOF_HEADERS
+
+          IFS=',' read -r -a OK_CODES <<< "${EXPECTED_CODES}"
+
+          mkdir -p artifacts
+          LOG_FILE="artifacts/api_checks.log"
+          : > "${LOG_FILE}"
+
+          EXIT_CODE=0
+
+          while IFS= read -r url; do
+            url="$(echo "$url" | sed 's/[[:space:]]*$//')"
+            [ -z "$url" ] && continue
+            case "$url" in \#*) continue;; esac
+
+            # Ejecuta curl y captura código y tiempo total en una sola llamada
+            read -r CODE SECS <<< "$(curl -sS -o /dev/null -w "%{http_code} %{time_total}" \
+              --connect-timeout "${TIMEOUT_SECONDS}" --max-time "${TIMEOUT_SECONDS}" \
+              "${HEADER_ARGS[@]}" "$url")" || true
+
+            # Convierte segundos->ms sin depender de python
+            MS=$(awk -v s="$SECS" 'BEGIN{printf("%.0f", s*1000)}')
+
+            # ¿código esperado?
+            OK=0
+            for c in "${OK_CODES[@]}"; do
+              [ "$CODE" = "$c" ] && OK=1 && break
+            done
+
+            if [ "$OK" -eq 1 ]; then
+              if [ "$MS" -gt "${LATENCY_FAIL_MS}" ]; then
+                echo "❌ ${url} -> ${CODE}, latencia ${MS}ms > ${LATENCY_FAIL_MS}ms" | tee -a "${LOG_FILE}"
+                EXIT_CODE=1
+              else
+                echo "✅ ${url} -> ${CODE} (${MS} ms)" | tee -a "${LOG_FILE}"
+              fi
+            else
+              echo "❌ ${url} -> ${CODE} (no está en EXPECTED_CODES=${EXPECTED_CODES})" | tee -a "${LOG_FILE}"
+              EXIT_CODE=1
+            fi
+
+          done < "${ENDPOINTS_FILE}"
+
+          echo
+          echo "Resumen:"
+          cat "${LOG_FILE}"
+
+          exit "${EXIT_CODE}"
         '''
       }
-    }
-
-    stage('Comprobar APIs') {
-      steps {
-        sh '''
-          set -e
-          . .venv/bin/activate
-
-          echo "=== Comprobando APIs desde api_endpoints.txt ==="
-          python - <<'PY'
-import requests, sys, time
-
-filename = "api_endpoints.txt"
-try:
-    with open(filename, "r") as f:
-        urls = [line.strip() for line in f if line.strip()]
-except FileNotFoundError:
-    print(f"ERROR: No se encuentra el archivo {filename}")
-    sys.exit(1)
-
-if not urls:
-    print("No hay URLs en el archivo.")
-    sys.exit(1)
-
-for url in urls:
-    print(f"\n🔎 Probando {url} ...")
-    try:
-        start = time.time()
-        resp = requests.get(url, timeout=10)
-        elapsed = round((time.time() - start) * 1000)
-        if resp.status_code == 200:
-            print(f"✅ {url} OK (HTTP 200) — {elapsed} ms")
-        else:
-            print(f"❌ {url} devolvió {resp.status_code}")
-            sys.exit(1)
-    except requests.exceptions.RequestException as e:
-        print(f"❌ Error al conectar con {url}: {e}")
-        sys.exit(1)
-
-print("\nTodas las APIs respondieron correctamente ✅")
-PY
-        '''
+      post {
+        always {
+          archiveArtifacts artifacts: 'artifacts/**', fingerprint: true, allowEmptyArchive: true
+        }
       }
     }
   }
 
   post {
-    success {
-      echo '✅ Todas las APIs están funcionando correctamente.'
-    }
-    failure {
-      echo '❌ Alguna API no respondió correctamente.'
-    }
+    success { echo '✅ Comprobación OK' }
+    failure { echo '❌ Alguna API falló (código o latencia)' }
   }
 }
