@@ -1,16 +1,14 @@
 pipeline {
   agent any
 
-  options {
-    timestamps()
-  }
+  options { timestamps() }
 
   parameters {
-    string(name: 'ENDPOINTS_FILE', defaultValue: 'api_endpoints.txt', description: 'Ruta del archivo con URLs')
-    string(name: 'TIMEOUT_SECONDS', defaultValue: '10', description: 'Timeout por request (curl --max-time)')
-    string(name: 'LATENCY_FAIL_MS', defaultValue: '2000', description: 'Umbral de fallo de latencia (ms)')
+    string(name: 'ENDPOINTS_FILE', defaultValue: 'api_endpoints.txt', description: 'Ruta del archivo con URLs (una por línea)')
+    string(name: 'TIMEOUT_SECONDS', defaultValue: '10', description: 'Timeout por petición')
     string(name: 'EXPECTED_CODES', defaultValue: '200,403', description: 'Códigos HTTP válidos, separados por coma')
-    text(name: 'HEADERS', defaultValue: '', description: 'Cabeceras: una por línea en formato key=value')
+    text(name: 'HEADERS', defaultValue: '', description: 'Cabeceras: una por línea, formato key=value. Se ignoran líneas vacías o que empiezan por #')
+    string(name: 'LATENCY_FAIL_MS', defaultValue: '2000', description: 'Falla si la latencia supera este umbral (ms)')
   }
 
   stages {
@@ -18,72 +16,82 @@ pipeline {
       steps { checkout scm }
     }
 
-    stage('Comprobar APIs con curl') {
+    stage('Preparar Python') {
       steps {
         sh '''
-          set -euo pipefail
-          echo "Leyendo endpoints de: ${ENDPOINTS_FILE}"
-          test -f "${ENDPOINTS_FILE}" || { echo "No existe ${ENDPOINTS_FILE}"; exit 1; }
+          set -e
+          if command -v python3 >/dev/null 2>&1; then PY=python3; else PY=python; fi
+          $PY -m venv .venv || true
+          . .venv/bin/activate
+          python -m pip install --upgrade pip >/dev/null
+          pip install requests >/dev/null
+        '''
+      }
+    }
 
-          # Construye -H para curl a partir de HEADERS (key=value por línea)
-          HEADER_ARGS=()
-          while IFS= read -r line; do
-            line="${line#"${line%%[![:space:]]*}"}"; line="${line%"${line##*[![:space:]]}"}"  # trim
-            [ -z "$line" ] && continue
-            case "$line" in \#*) continue;; esac
-            key="${line%%=*}"
-            val="${line#*=}"
-            HEADER_ARGS+=(-H "${key}: ${val}")
-          done <<'EOF_HEADERS'
-${HEADERS}
-EOF_HEADERS
+    stage('Comprobar APIs') {
+      steps {
+        sh '''
+          set -e
+          . .venv/bin/activate
+          python - <<'PY'
+import os, sys, time, requests
 
-          IFS=',' read -r -a OK_CODES <<< "${EXPECTED_CODES}"
+endpoints_file = os.environ.get('ENDPOINTS_FILE', 'api_endpoints.txt')
+timeout = float(os.environ.get('TIMEOUT_SECONDS', '10'))
+expected_codes = {c.strip() for c in os.environ.get('EXPECTED_CODES','200').split(',') if c.strip()}
+latency_fail_ms = int(os.environ.get('LATENCY_FAIL_MS','2000'))
 
-          mkdir -p artifacts
-          LOG_FILE="artifacts/api_checks.log"
-          : > "${LOG_FILE}"
+# Parseo de cabeceras key=value, se ignoran vacías o que empiezan por #
+headers = {}
+for raw in os.environ.get('HEADERS','').splitlines():
+    line = raw.strip()
+    if not line or line.lstrip().startswith('#') or '=' not in line:
+        continue
+    k, v = line.split('=', 1)
+    headers[k.strip()] = v.strip()
 
-          EXIT_CODE=0
+# Leer URLs
+try:
+    with open(endpoints_file, 'r') as f:
+        urls = [ln.strip() for ln in f if ln.strip() and not ln.lstrip().startswith('#')]
+except FileNotFoundError:
+    print(f"ERROR: No existe {endpoints_file}")
+    sys.exit(1)
 
-          while IFS= read -r url; do
-            url="$(echo "$url" | sed 's/[[:space:]]*$//')"
-            [ -z "$url" ] && continue
-            case "$url" in \#*) continue;; esac
+if not urls:
+    print("ERROR: No hay URLs para comprobar.")
+    sys.exit(1)
 
-            # Ejecuta curl y captura código y tiempo total en una sola llamada
-            read -r CODE SECS <<< "$(curl -sS -o /dev/null -w "%{http_code} %{time_total}" \
-              --connect-timeout "${TIMEOUT_SECONDS}" --max-time "${TIMEOUT_SECONDS}" \
-              "${HEADER_ARGS[@]}" "$url")" || true
+os.makedirs('artifacts', exist_ok=True)
+log_path = 'artifacts/api_checks.log'
+fail = False
 
-            # Convierte segundos->ms sin depender de python
-            MS=$(awk -v s="$SECS" 'BEGIN{printf("%.0f", s*1000)}')
+with open(log_path, 'w', encoding='utf-8') as log:
+    for url in urls:
+        t0 = time.perf_counter()
+        try:
+            resp = requests.get(url, headers=headers, timeout=timeout)
+            ms = int((time.perf_counter() - t0) * 1000)
+            code = str(resp.status_code)
+            if code in expected_codes:
+                if ms > latency_fail_ms:
+                    msg = f"❌ {url} -> {code}, latencia {ms}ms > {latency_fail_ms}ms"
+                    print(msg); log.write(msg + "\\n"); fail = True
+                else:
+                    msg = f"✅ {url} -> {code} ({ms} ms)"
+                    print(msg); log.write(msg + "\\n")
+            else:
+                body = (resp.text or '')[:200].replace('\\n',' ')
+                msg = f"❌ {url} -> {code} (esperados {sorted(expected_codes)}). Body: {body}..."
+                print(msg); log.write(msg + "\\n"); fail = True
+        except requests.RequestException as e:
+            msg = f"❌ {url} Error: {e}"
+            print(msg); log.write(msg + "\\n"); fail = True
 
-            # ¿código esperado?
-            OK=0
-            for c in "${OK_CODES[@]}"; do
-              [ "$CODE" = "$c" ] && OK=1 && break
-            done
-
-            if [ "$OK" -eq 1 ]; then
-              if [ "$MS" -gt "${LATENCY_FAIL_MS}" ]; then
-                echo "❌ ${url} -> ${CODE}, latencia ${MS}ms > ${LATENCY_FAIL_MS}ms" | tee -a "${LOG_FILE}"
-                EXIT_CODE=1
-              else
-                echo "✅ ${url} -> ${CODE} (${MS} ms)" | tee -a "${LOG_FILE}"
-              fi
-            else
-              echo "❌ ${url} -> ${CODE} (no está en EXPECTED_CODES=${EXPECTED_CODES})" | tee -a "${LOG_FILE}"
-              EXIT_CODE=1
-            fi
-
-          done < "${ENDPOINTS_FILE}"
-
-          echo
-          echo "Resumen:"
-          cat "${LOG_FILE}"
-
-          exit "${EXIT_CODE}"
+print("\\nResumen guardado en artifacts/api_checks.log")
+sys.exit(1 if fail else 0)
+PY
         '''
       }
       post {
