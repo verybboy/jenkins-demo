@@ -16,78 +16,77 @@ pipeline {
     }
 
     stage('Comprobar APIs con curl') {
-      steps {
-        sh '''
-          set -euo pipefail
+        steps {
+            sh '''bash -euo pipefail <<'BASH'
+        # Validar archivo de endpoints
+        test -f "${ENDPOINTS_FILE}" || { echo "No existe ${ENDPOINTS_FILE}"; exit 1; }
 
-          # Validar archivo de endpoints
-          test -f "${ENDPOINTS_FILE}" || { echo "No existe ${ENDPOINTS_FILE}"; exit 1; }
+        mkdir -p artifacts
 
-          mkdir -p artifacts
-
-          # Generar archivo de cabeceras para curl --config
-          # HEADERS: key=value -> "header = key: value"
-          awk '
-            NF && $0 !~ /^[[:space:]]*#/ && index($0,"=")>0 {
-              key=$0; sub(/=.*/,"",key);
-              val=$0; sub(/^[^=]*=/,"",val);
-              printf "header = %s: %s\\n", key, val
-            }
-          ' > artifacts/curl_headers.txt <<'EOFH'
-${HEADERS}
-EOFH
-
-          # Filtrar URLs (sin vacías ni comentarios)
-          awk 'NF && $0 !~ /^[[:space:]]*#/' "${ENDPOINTS_FILE}" > artifacts/urls.txt
-          if [ ! -s artifacts/urls.txt ]; then
-            echo "No hay URLs válidas en ${ENDPOINTS_FILE}"
-            exit 1
-          fi
-
-          IFS=',' read -r -a OK_CODES <<< "${EXPECTED_CODES}"
-
-          LOG="artifacts/api_checks.log"
-          : > "$LOG"
-          EXIT=0
-
-          while IFS= read -r url; do
-            echo "Probando: $url"
-            # Ejecutar curl: código + tiempo total (seg)
-            read -r CODE SECS <<< "$(curl -sS -o /dev/null -w "%{http_code} %{time_total}" \
-              --connect-timeout "${TIMEOUT_SECONDS}" --max-time "${TIMEOUT_SECONDS}" \
-              --config artifacts/curl_headers.txt "$url" || true)"
-            # Convertir a ms
-            MS=$(awk -v s="$SECS" 'BEGIN{printf("%.0f", s*1000)}')
-
-            # ¿código esperado?
-            OK=0
-            for c in "${OK_CODES[@]}"; do
-              [ "$CODE" = "$c" ] && OK=1 && break
-            done
-
-            if [ "$OK" -eq 1 ]; then
-              if [ "$MS" -gt "${LATENCY_FAIL_MS}" ]; then
-                echo "❌ $url -> $CODE, latencia ${MS}ms > ${LATENCY_FAIL_MS}ms" | tee -a "$LOG"
-                EXIT=1
-              else
-                echo "✅ $url -> $CODE (${MS} ms)" | tee -a "$LOG"
-              fi
-            else
-              echo "❌ $url -> $CODE (no está en EXPECTED_CODES=${EXPECTED_CODES})" | tee -a "$LOG"
-              EXIT=1
-            fi
-          done < artifacts/urls.txt
-
-          echo; echo "Resumen:"; cat "$LOG"
-          exit "$EXIT"
-        '''
-      }
-      post {
-        always {
-          archiveArtifacts artifacts: 'artifacts/**', fingerprint: true, allowEmptyArchive: true
+        # Generar archivo de cabeceras para curl --config
+        # HEADERS: key=value -> "header = key: value"
+        awk '
+        NF && $0 !~ /^[[:space:]]*#/ && index($0,"=")>0 {
+            key=$0; sub(/=.*/,"",key);
+            val=$0; sub(/^[^=]*=/,"",val);
+            printf "header = %s: %s\\n", key, val
         }
-      }
+        ' > artifacts/curl_headers.txt <<EOFH
+        ${HEADERS}
+        EOFH
+
+        # Filtrar URLs (sin vacías ni comentarios)
+        awk 'NF && $0 !~ /^[[:space:]]*#/' "${ENDPOINTS_FILE}" > artifacts/urls.txt
+        if [ ! -s artifacts/urls.txt ]; then
+        echo "No hay URLs válidas en ${ENDPOINTS_FILE}"
+        exit 1
+        fi
+
+        IFS=',' read -r -a OK_CODES <<< "${EXPECTED_CODES}"
+
+        LOG="artifacts/api_checks.log"
+        : > "$LOG"
+        EXIT=0
+
+        while IFS= read -r url; do
+        echo "Probando: $url"
+        # Ejecutar curl: código + tiempo total (seg)
+        read -r CODE SECS <<< "$(curl -sS -o /dev/null -w "%{http_code} %{time_total}" \
+            --connect-timeout "${TIMEOUT_SECONDS}" --max-time "${TIMEOUT_SECONDS}" \
+            --config artifacts/curl_headers.txt "$url" || true)"
+        # Convertir a ms
+        MS=$(awk -v s="$SECS" 'BEGIN{printf("%.0f", s*1000)}')
+
+        # ¿código esperado?
+        OK=0
+        for c in "${OK_CODES[@]}"; do
+            [ "$CODE" = "$c" ] && OK=1 && break
+        done
+
+        if [ "$OK" -eq 1 ]; then
+            if [ "$MS" -gt "${LATENCY_FAIL_MS}" ]; then
+            echo "❌ $url -> $CODE, latencia ${MS}ms > ${LATENCY_FAIL_MS}ms" | tee -a "$LOG"
+            EXIT=1
+            else
+            echo "✅ $url -> $CODE (${MS} ms)" | tee -a "$LOG"
+            fi
+        else
+            echo "❌ $url -> $CODE (no está en EXPECTED_CODES=${EXPECTED_CODES})" | tee -a "$LOG"
+            EXIT=1
+        fi
+        done < artifacts/urls.txt
+
+        echo; echo "Resumen:"; cat "$LOG"
+        exit "$EXIT"
+        BASH'''
+        }
+        post {
+            always {
+            archiveArtifacts artifacts: 'artifacts/**', fingerprint: true, allowEmptyArchive: true
+            }
+        }
     }
+
   }
 
   post {
