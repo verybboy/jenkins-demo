@@ -60,7 +60,7 @@ pipeline {
 
         # Elige método: GET por defecto. Si quieres OPTIONS, descomenta la línea con -X OPTIONS
         CURL_METHOD_OPTS=()
-        # CURL_METHOD_OPTS=(-X OPTIONS)
+        CURL_METHOD_OPTS=(-X OPTIONS)
 
         # Ejecutar curl: código + tiempo total (seg)
         read -r CODE SECS <<< "$(curl -sS -o /dev/null -w "%{http_code} %{time_total}" \

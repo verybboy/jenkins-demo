@@ -1,1 +1,1 @@
-https://54haj1ch4k.execute-api.us-east-1.amazonaws.com
+https://54haj1ch4k.execute-api.us-east-1.amazonaws.com/subscribe
