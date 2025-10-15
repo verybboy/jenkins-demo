@@ -6,7 +6,7 @@ pipeline {
     string(name: 'ENDPOINTS_FILE',   defaultValue: 'api_endpoints.txt', description: 'Archivo con URLs (una por línea)')
     string(name: 'TIMEOUT_SECONDS',  defaultValue: '10',  description: 'Timeout de curl (--max-time)')
     string(name: 'LATENCY_FAIL_MS',  defaultValue: '2000', description: 'Falla si la latencia supera este umbral (ms)')
-    string(name: 'EXPECTED_CODES',   defaultValue: '200,403', description: 'Códigos HTTP válidos (coma)')
+    string(name: 'EXPECTED_CODES',   defaultValue: '200,204,403', description: 'Códigos HTTP válidos (coma)')
     text(  name: 'HEADERS',          defaultValue: '', description: 'Cabeceras key=value (una por línea). Se ignoran líneas vacías o con #')
   }
 
