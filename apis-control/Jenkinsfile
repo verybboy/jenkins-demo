@@ -18,31 +18,38 @@ pipeline {
     stage('Comprobar APIs con curl') {
         steps {
             sh '''bash -euo pipefail <<'BASH'
-        # Validar archivo de endpoints
-        test -f "${ENDPOINTS_FILE}" || { echo "No existe ${ENDPOINTS_FILE}"; exit 1; }
+        # --- normaliza ruta del fichero de endpoints ---
+        FILE="${ENDPOINTS_FILE:-api_endpoints.txt}"
+        case "$FILE" in
+        /*) ;;                       # absoluta
+        *)  FILE="$WORKSPACE/$FILE" ;;
+        esac
+
+        test -f "$FILE" || { echo "No existe $FILE"; exit 1; }
+        echo "Leyendo endpoints de: $FILE"
 
         mkdir -p artifacts
 
-        # Generar archivo de cabeceras para curl --config
-        # HEADERS: key=value -> "header = key: value"
-        awk '
+        # --- generar archivo de cabeceras para curl --config ---
+        # Si HEADERS no está definido, usa vacío para no romper con -u
+        printf '%s\n' "${HEADERS-}" | awk '
         NF && $0 !~ /^[[:space:]]*#/ && index($0,"=")>0 {
             key=$0; sub(/=.*/,"",key);
             val=$0; sub(/^[^=]*=/,"",val);
             printf "header = %s: %s\\n", key, val
         }
-        ' > artifacts/curl_headers.txt <<EOFH
-        ${HEADERS}
-        EOFH
+        ' > artifacts/curl_headers.txt
 
-        # Filtrar URLs (sin vacías ni comentarios)
-        awk 'NF && $0 !~ /^[[:space:]]*#/' "${ENDPOINTS_FILE}" > artifacts/urls.txt
+        # --- filtrar URLs (sin vacías ni comentarios) ---
+        awk 'NF && $0 !~ /^[[:space:]]*#/' "$FILE" > artifacts/urls.txt
         if [ ! -s artifacts/urls.txt ]; then
-        echo "No hay URLs válidas en ${ENDPOINTS_FILE}"
+        echo "No hay URLs válidas en $FILE"
         exit 1
         fi
 
-        IFS=',' read -r -a OK_CODES <<< "${EXPECTED_CODES}"
+        # --- códigos esperados ---
+        EXP="${EXPECTED_CODES-200,403}"
+        IFS=',' read -r -a OK_CODES <<< "$EXP"
 
         LOG="artifacts/api_checks.log"
         : > "$LOG"
@@ -50,10 +57,18 @@ pipeline {
 
         while IFS= read -r url; do
         echo "Probando: $url"
+
+        # Elige método: GET por defecto. Si quieres OPTIONS, descomenta la línea con -X OPTIONS
+        CURL_METHOD_OPTS=()
+        # CURL_METHOD_OPTS=(-X OPTIONS)
+
         # Ejecutar curl: código + tiempo total (seg)
         read -r CODE SECS <<< "$(curl -sS -o /dev/null -w "%{http_code} %{time_total}" \
             --connect-timeout "${TIMEOUT_SECONDS}" --max-time "${TIMEOUT_SECONDS}" \
-            --config artifacts/curl_headers.txt "$url" || true)"
+            --config artifacts/curl_headers.txt \
+            "${CURL_METHOD_OPTS[@]}" \
+            "$url" || true)"
+
         # Convertir a ms
         MS=$(awk -v s="$SECS" 'BEGIN{printf("%.0f", s*1000)}')
 
@@ -71,7 +86,7 @@ pipeline {
             echo "✅ $url -> $CODE (${MS} ms)" | tee -a "$LOG"
             fi
         else
-            echo "❌ $url -> $CODE (no está en EXPECTED_CODES=${EXPECTED_CODES})" | tee -a "$LOG"
+            echo "❌ $url -> $CODE (no está en EXPECTED_CODES=${EXP})" | tee -a "$LOG"
             EXIT=1
         fi
         done < artifacts/urls.txt
